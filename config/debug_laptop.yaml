@@ -1,0 +1,46 @@
+# debug_laptop.yaml
+# ------------------
+# A DELIBERATELY TINY config so the whole pipeline (model -> memory ->
+# sleep -> dreaming -> distillation) can be run end-to-end on an RTX 3050
+# 4GB laptop GPU in seconds, to verify correctness before scaling up on
+# Lightning AI. This is NOT meant to produce a good model -- it's meant to
+# prove every module "compiles" (per your instructions: every module
+# should compile before moving to the next one).
+#
+# Rough VRAM budget at these settings: hidden_dim=128, 2 sequence layers,
+# 2 memory levels with 1-2 experts each -> well under 100MB of parameters.
+# This leaves you huge headroom to debug in VS Code without OOM errors.
+
+experiment_name: sleepllm_debug_laptop
+seed: 42
+
+model:
+  vocab_size: 50257       # GPT-2 tokenizer vocab (small, laptop-friendly)
+  hidden_dim: 128
+  num_attention_heads: 4
+  num_sequence_layers: 2
+  max_sequence_length: 128
+  dropout: 0.1
+  sequence_layer_type: attention
+
+memory:
+  levels:
+    # Fast, short-term block: updates often (small chunk_length),
+    # analogous to "High Frequency FFN" in Figure 7 of the paper.
+    - name: high_freq
+      update_frequency: 1000
+      chunk_length: 16
+      num_experts: 1
+      expert_hidden_dim: 128
+      lora_rank: 4
+      max_experts: 8
+
+    # Slow, long-term block: updates rarely (large chunk_length),
+    # analogous to "Low Frequency FFN" in Figure 7.
+    - name: low_freq
+      update_frequency: 10
+      chunk_length: 64        # must be a multiple of high_freq's 16
+      num_experts: 1
+      expert_hidden_dim: 128
+      lora_rank: 4
+      max_experts: 8

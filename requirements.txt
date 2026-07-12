@@ -1,0 +1,19 @@
+# Core deep learning
+torch>=2.2.0
+transformers>=4.40.0
+
+# Config system (Module 1)
+PyYAML>=6.0
+
+# Logging / experiment tracking (used starting Module 2)
+tqdm>=4.66.0
+
+# Testing
+pytest>=8.0.0
+
+# Evaluation / metrics (used later in evaluation/)
+scikit-learn>=1.4.0
+python-Levenshtein>=0.25.0   # needed for r_abs (Eq. 4) Levenshtein reward
+
+# Optional but recommended once we're on Lightning AI
+# lightning>=2.2.0
