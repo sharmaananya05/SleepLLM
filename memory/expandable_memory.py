@@ -72,6 +72,14 @@ class ExpandableMemoryLevel(nn.Module):
         # checkpoint without it would silently un-grow the model.
         self.register_buffer("active_mask", active_mask, persistent=True)
 
+        # Used by dreaming/dream_generator.py's random_expert_injection()
+        # context manager (Module 7, paper Section 3.4: "each router in
+        # MoE blocks additionally chooses a random expert"). 0.0 = off
+        # (normal top-1 routing) -- this is a plain Python attribute, not
+        # a buffer/parameter, since it's a transient generation-time
+        # setting, never saved to or loaded from a checkpoint.
+        self._force_random_prob: float = 0.0
+
     @property
     def num_active_experts(self) -> int:
         return int(self.active_mask.sum().item())
@@ -128,6 +136,27 @@ class ExpandableMemoryLevel(nn.Module):
 
         router_probs = F.softmax(router_logits, dim=-1)
         top1_prob, top1_idx = router_probs.max(dim=-1)
+
+        # Dreaming's random-expert injection (paper Section 3.4): with
+        # probability self._force_random_prob, REPLACE a token's routed
+        # expert with a uniformly random ACTIVE expert, regardless of
+        # what the router actually preferred. This surfaces knowledge
+        # stored in experts the router would normally never pick for
+        # this input -- the whole point being to "incorporate random
+        # irrelevant knowledge ... learning the underlying patterns that
+        # are hidden from model's sight."
+        if self._force_random_prob > 0.0:
+            active_indices = self.active_mask.nonzero(as_tuple=True)[0]
+            random_mask = torch.rand(top1_idx.shape, device=x.device) < self._force_random_prob
+            random_experts = active_indices[
+                torch.randint(0, len(active_indices), top1_idx.shape, device=x.device)
+            ]
+            top1_idx = torch.where(random_mask, random_experts, top1_idx)
+            # Keep top1_prob as the ROUTER's own confidence (not
+            # artificially inflated for randomly-forced tokens) -- this
+            # means randomly-injected expert outputs are naturally
+            # down-weighted relative to the router's genuine top choice,
+            # a soft rather than hard injection.
 
         output = torch.zeros_like(x)
         for expert_id, expert in enumerate(self.experts):
