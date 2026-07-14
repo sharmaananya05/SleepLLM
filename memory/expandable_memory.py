@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from config.model_config import MemoryLevelConfig
 from memory.lora_expert import LowRankExpert
-from models.expert import Expert
+from memory.dense_expert import Expert
 
 
 class ExpandableMemoryLevel(nn.Module):
@@ -83,6 +83,81 @@ class ExpandableMemoryLevel(nn.Module):
     @property
     def num_active_experts(self) -> int:
         return int(self.active_mask.sum().item())
+
+    def unlearn(self, expert_idx: int) -> None:
+        """
+        The structural counterpart to expand(): DEACTIVATES a specific
+        expert and resets its parameters, removing whatever knowledge it
+        stored from the model's behavior going forward.
+
+        This directly extends an idea the paper ALREADY uses: Section
+        3.3 describes resetting a low-rank expert's parameters after its
+        knowledge has been consolidated into the next level, "a similar
+        procedure of synaptic pruning in human brain, in which brain
+        prunes connections that are unnecessarily and/or redundant." We
+        reuse that exact mechanism here for a new purpose: TARGETED
+        UNLEARNING, i.e. deliberately removing a specific memory rather
+        than routine capacity reclamation.
+
+        Args:
+            expert_idx: index of the expert to unlearn. Must currently
+                be ACTIVE (unlearning an already-inactive slot is a
+                no-op error, not silently ignored -- same "fail loudly"
+                philosophy as expand()).
+
+        What "unlearn" means concretely, in order:
+        1. Deactivate the slot (active_mask[expert_idx] = False) -- the
+           router immediately stops routing ANY tokens to it (paper's
+           masking mechanism, Module 4), so it contributes NOTHING to
+           future forward passes.
+        2. Reset its parameters via re-initialization -- so even if it
+           were somehow reactivated later, no trace of the unlearned
+           knowledge would remain in its weights. This matters for
+           unlearning specifically (vs. ordinary capacity reclamation):
+           we want the INFORMATION gone, not just inactive.
+
+        Raises:
+            RuntimeError: if expert_idx is not currently active, or if
+                it's a "base" dense Expert rather than a grown
+                LowRankExpert (see note below).
+
+        Note on WHICH experts can be unlearned: the paper does not
+        specify unlearning at all -- this whole method is our addition
+        (per your project's explicit scope). We allow unlearning ANY
+        active expert, base OR grown, since restricting it to only
+        grown (LowRankExpert) slots would be an arbitrary limitation not
+        justified by anything in the paper; the mechanism (mask + reset)
+        works identically for either expert type.
+        """
+        if expert_idx >= self.config.max_experts or expert_idx < 0:
+            raise ValueError(f"expert_idx {expert_idx} out of range [0, {self.config.max_experts})")
+        if not self.active_mask[expert_idx]:
+            raise RuntimeError(
+                f"[{self.config.name}] Cannot unlearn expert {expert_idx}: it is "
+                f"already inactive (nothing to unlearn)."
+            )
+
+        expert = self.experts[expert_idx]
+        # Re-initialize matching each expert type's OWN documented init
+        # scheme exactly (not PyTorch's generic default reset_parameters,
+        # which would use Kaiming init and NOT match LowRankExpert's
+        # deliberate LoRA-style A~N(0,0.02)/B=0 scheme from
+        # memory/lora_expert.py -- using the generic reset here would
+        # silently produce a differently-distributed "reset" expert than
+        # a freshly grown one, an easy, subtle correctness bug to miss).
+        if hasattr(expert, "A") and hasattr(expert, "B"):
+            # LowRankExpert (memory/lora_expert.py)
+            torch.nn.init.normal_(expert.A.weight, std=0.02)
+            torch.nn.init.zeros_(expert.B.weight)
+        else:
+            # Dense Expert (models/expert.py) -- matches its own
+            # constructor's use of PyTorch's default nn.Linear init
+            # (Kaiming uniform), so just re-running reset_parameters()
+            # on its two Linear layers IS correct here.
+            expert.fc1.reset_parameters()
+            expert.fc2.reset_parameters()
+
+        self.active_mask[expert_idx] = False
 
     def expand(self) -> int:
         """
@@ -163,9 +238,26 @@ class ExpandableMemoryLevel(nn.Module):
             if not self.active_mask[expert_id]:
                 continue  # skip inactive slots entirely: no compute, no grad
             token_mask = (top1_idx == expert_id).unsqueeze(-1)
-            if token_mask.any():
-                expert_out = expert(x)
-                output = output + expert_out * token_mask
+            # IMPORTANT: always run the expert's forward pass, even if
+            # NO tokens in this specific batch route to it (token_mask is
+            # all-False). We used to skip this as a compute-saving
+            # optimization, but that has a serious correctness cost: if
+            # a KNOWLEDGE SEEDING step (distillation/knowledge_seeding.py,
+            # trainer/trainer.py) uses a FIXED reference batch that
+            # happens to route zero tokens to the newly-activated target
+            # expert, skipping its forward pass here means that expert
+            # NEVER appears in the autograd graph at all -- causing
+            # `.backward()` to fail with "does not require grad and does
+            # not have a grad_fn" on the very expert we're trying to
+            # train. Always computing expert_out (and multiplying by a
+            # token_mask that may be all-zero) keeps every active expert
+            # in the computation graph -- worst case its gradient is
+            # exactly zero this step, which is correct and safe, rather
+            # than crashing. The extra compute cost is small: our
+            # experts are tiny (expert_hidden_dim ~128), so this is a
+            # deliberate correctness-over-speed trade-off.
+            expert_out = expert(x)
+            output = output + expert_out * token_mask
 
         output = output * top1_prob.unsqueeze(-1)
         return output
